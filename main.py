@@ -159,12 +159,26 @@ RIGHT_MOUTH_CORNER_INDEX = 291
 
 ## MediaPipe Model Confidence Parameters
 # These thresholds determine how confidently the model must detect or track to consider the results valid.
-MIN_DETECTION_CONFIDENCE = 0.8
-MIN_TRACKING_CONFIDENCE = 0.8
+# Lower values = more sensitive detection, higher values = more stable but may miss faces
+MIN_DETECTION_CONFIDENCE = 0.5  # Reduced from 0.8 for better detection
+MIN_TRACKING_CONFIDENCE = 0.5   # Reduced from 0.8 for better tracking
 
 ## Angle Normalization Parameters
 # MOVING_AVERAGE_WINDOW: The number of frames over which to calculate the moving average for smoothing angles.
-MOVING_AVERAGE_WINDOW = 10
+MOVING_AVERAGE_WINDOW = 15  # Increased for better smoothing
+
+## Enhanced Tracking Parameters
+# LANDMARK_SMOOTHING_WINDOW: Number of frames to smooth landmark positions
+LANDMARK_SMOOTHING_WINDOW = 5
+
+# FACE_DETECTION_TIMEOUT: Frames to wait before considering face lost
+FACE_DETECTION_TIMEOUT = 10
+
+# ENABLE_FRAME_PREPROCESSING: Apply image enhancement for better detection
+ENABLE_FRAME_PREPROCESSING = True
+
+# ENABLE_LANDMARK_SMOOTHING: Apply smoothing to landmark positions
+ENABLE_LANDMARK_SMOOTHING = True
 
 # Initial Calibration Flags
 # initial_pitch, initial_yaw, initial_roll: Store the initial head pose angles for calibration purposes.
@@ -255,12 +269,139 @@ calibration_screen_bounds = {}  # Screen boundary data
 calibration_eye_centers = {}  # Eye center positions for each target
 calibration_start_time = None  # When calibration started
 
+# Enhanced Tracking Variables
+landmark_history = []  # Store recent landmark positions for smoothing
+face_detection_failures = 0  # Count consecutive detection failures
+last_valid_landmarks = None  # Store last valid landmarks for fallback
+landmark_smoothing_buffer = []  # Buffer for landmark smoothing
+
 
 # Function to calculate vector position
 def vector_position(point1, point2):
     x1, y1 = point1.ravel()
     x2, y2 = point2.ravel()
     return x2 - x1, y2 - y1
+
+
+def preprocess_frame(frame):
+    """
+    Apply image preprocessing to improve face detection accuracy.
+    
+    Args:
+        frame: Input frame from camera
+        
+    Returns:
+        Enhanced frame for better detection
+    """
+    if not ENABLE_FRAME_PREPROCESSING:
+        return frame
+    
+    # Convert to LAB color space for better lighting normalization
+    lab = cv.cvtColor(frame, cv.COLOR_BGR2LAB)
+    l, a, b = cv.split(lab)
+    
+    # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to L channel
+    clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    
+    # Merge channels back
+    lab = cv.merge([l, a, b])
+    enhanced = cv.cvtColor(lab, cv.COLOR_LAB2BGR)
+    
+    # Apply slight Gaussian blur to reduce noise
+    enhanced = cv.GaussianBlur(enhanced, (3, 3), 0)
+    
+    return enhanced
+
+
+def smooth_landmarks(landmarks, img_w, img_h):
+    """
+    Apply temporal smoothing to landmark positions for more stable tracking.
+    
+    Args:
+        landmarks: Current landmark positions
+        img_w, img_h: Image dimensions
+        
+    Returns:
+        Smoothed landmark positions
+    """
+    global landmark_smoothing_buffer, last_valid_landmarks
+    
+    if not ENABLE_LANDMARK_SMOOTHING:
+        return landmarks
+    
+    # Convert landmarks to numpy array
+    current_landmarks = np.array(landmarks)
+    
+    # Add to smoothing buffer
+    landmark_smoothing_buffer.append(current_landmarks)
+    
+    # Keep only recent frames
+    if len(landmark_smoothing_buffer) > LANDMARK_SMOOTHING_WINDOW:
+        landmark_smoothing_buffer.pop(0)
+    
+    # If we have enough frames, apply smoothing
+    if len(landmark_smoothing_buffer) >= 3:
+        # Calculate weighted average (more weight to recent frames)
+        weights = np.linspace(0.5, 1.0, len(landmark_smoothing_buffer))
+        weights = weights / np.sum(weights)
+        
+        # Initialize with proper dtype
+        smoothed_landmarks = np.zeros_like(current_landmarks, dtype=np.float64)
+        for i, landmark_set in enumerate(landmark_smoothing_buffer):
+            smoothed_landmarks += weights[i] * landmark_set.astype(np.float64)
+        
+        # Convert to int after all calculations
+        smoothed_landmarks_int = smoothed_landmarks.astype(np.int32)
+        last_valid_landmarks = smoothed_landmarks_int
+        return smoothed_landmarks_int
+    else:
+        # Not enough frames yet, use current landmarks
+        last_valid_landmarks = current_landmarks
+        return current_landmarks
+
+
+def detect_face_quality(landmarks, img_w, img_h):
+    """
+    Assess the quality of face detection based on landmark positions.
+    
+    Args:
+        landmarks: Detected landmark positions
+        img_w, img_h: Image dimensions
+        
+    Returns:
+        Quality score (0-1, higher is better)
+    """
+    if landmarks is None or len(landmarks) == 0:
+        return 0.0
+    
+    # Check if key facial features are within reasonable bounds
+    nose_tip = landmarks[NOSE_TIP_INDEX]
+    left_eye = landmarks[LEFT_EYE_LEFT_CORNER_INDEX]
+    right_eye = landmarks[RIGHT_EYE_RIGHT_CORNER_INDEX]
+    
+    # Check if landmarks are within image bounds
+    margin = 50
+    if (nose_tip[0] < margin or nose_tip[0] > img_w - margin or
+        nose_tip[1] < margin or nose_tip[1] > img_h - margin):
+        return 0.3
+    
+    # Check eye distance (should be reasonable)
+    eye_distance = np.linalg.norm(left_eye - right_eye)
+    expected_eye_distance = img_w * 0.15  # Roughly 15% of image width
+    
+    if eye_distance < expected_eye_distance * 0.5 or eye_distance > expected_eye_distance * 2.0:
+        return 0.4
+    
+    # Check if face is roughly centered
+    face_center_x = (left_eye[0] + right_eye[0]) / 2
+    center_deviation = abs(face_center_x - img_w / 2) / (img_w / 2)
+    
+    if center_deviation > 0.7:  # Too far from center
+        return 0.5
+    
+    # All checks passed
+    return 1.0
 
 
 def euclidean_distance_3D(points):
@@ -843,6 +984,7 @@ mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
     refine_landmarks=True,
     min_detection_confidence=MIN_DETECTION_CONFIDENCE,
     min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
+    static_image_mode=False,  # Optimize for video
 )
 cam_source = int(args.camSource)
 cap = cv.VideoCapture(cam_source)
@@ -913,21 +1055,59 @@ try:
         if not ret:
             break
 
+        # Apply frame preprocessing for better detection
+        enhanced_frame = preprocess_frame(frame)
+        
         # Flipping the frame for a mirror effect
         # I think we better not flip to correspond with real world... need to make sure later...
         #frame = cv.flip(frame, 1)
-        rgb_frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+        rgb_frame = cv.cvtColor(enhanced_frame, cv.COLOR_BGR2RGB)
         img_h, img_w = frame.shape[:2]
         results = mp_face_mesh.process(rgb_frame)
 
         if results.multi_face_landmarks:
-            mesh_points = np.array(
+            # Reset detection failure counter on successful detection
+            face_detection_failures = 0
+            
+            # Get raw landmarks
+            raw_mesh_points = np.array(
                 [
-                    np.multiply([p.x, p.y], [img_w, img_h]).astype(int)
+                    np.multiply([p.x, p.y], [img_w, img_h]).astype(np.int32)
                     for p in results.multi_face_landmarks[0].landmark
                 ]
             )
             
+            # Check face detection quality
+            face_quality = detect_face_quality(raw_mesh_points, img_w, img_h)
+            
+            # Apply smoothing if quality is good enough
+            if face_quality > 0.3:  # Minimum quality threshold
+                mesh_points = smooth_landmarks(raw_mesh_points, img_w, img_h)
+            else:
+                # Use last valid landmarks if current detection is poor
+                if last_valid_landmarks is not None:
+                    mesh_points = last_valid_landmarks
+                    if PRINT_DATA:
+                        print(f"⚠️ Poor face detection quality ({face_quality:.2f}), using last valid landmarks")
+                else:
+                    mesh_points = raw_mesh_points
+        else:
+            # No face detected - increment failure counter
+            face_detection_failures += 1
+            
+            # Use last valid landmarks if available and not too many failures
+            if last_valid_landmarks is not None and face_detection_failures < FACE_DETECTION_TIMEOUT:
+                mesh_points = last_valid_landmarks
+                if PRINT_DATA and face_detection_failures % 10 == 0:  # Print every 10 frames
+                    print(f"⚠️ No face detected, using last valid landmarks (failures: {face_detection_failures})")
+            else:
+                # Skip processing this frame
+                if PRINT_DATA and face_detection_failures == FACE_DETECTION_TIMEOUT:
+                    print("❌ Face detection lost, skipping frame processing")
+                continue
+        
+        # Only process if we have valid landmarks
+        if 'mesh_points' in locals():
             # CALIBRATION MODE
             if CALIBRATION_MODE:
                 if current_calibration_target < len(calibration_targets):
@@ -982,11 +1162,16 @@ try:
             nose_3D_point = np.multiply(head_pose_points_3D[0], [1, 1, 3000])
             nose_2D_point = head_pose_points_2D[0]
 
-            # create the camera matrix
-            focal_length = 1 * img_w
+            # create the camera matrix - IMPROVED VERSION
+            # Use a more realistic focal length based on typical webcam FOV
+            focal_length = img_w * 0.8  # More realistic focal length
+            center_x = img_w / 2.0
+            center_y = img_h / 2.0
 
             cam_matrix = np.array(
-                [[focal_length, 0, img_h / 2], [0, focal_length, img_w / 2], [0, 0, 1]]
+                [[focal_length, 0, center_x], 
+                 [0, focal_length, center_y], 
+                 [0, 0, 1]], dtype=np.float64
             )
 
             # The distortion parameters
@@ -1034,18 +1219,30 @@ try:
                     2,
                     cv.LINE_AA,
                 )
-            # Display the nose direction
+            
+            # Display the nose direction - FIXED VERSION
+            # Create a 3D point extending from nose tip in the direction of head orientation
+            nose_3D_direction = np.array([0, 0, 1000], dtype=np.float64)  # 1000mm forward
+            
+            # Project the 3D direction point to 2D
             nose_3d_projection, jacobian = cv.projectPoints(
-                nose_3D_point, rot_vec, trans_vec, cam_matrix, dist_matrix
+                nose_3D_direction.reshape(1, 1, 3), rot_vec, trans_vec, cam_matrix, dist_matrix
             )
-
-            p1 = nose_2D_point
-            p2 = (
-                int(nose_2D_point[0] + angle_y * 10),
-                int(nose_2D_point[1] - angle_x * 10),
-            )
-
+            
+            # Get the projected point
+            p1 = (int(nose_2D_point[0]), int(nose_2D_point[1]))  # Nose tip
+            p2 = (int(nose_3d_projection[0][0][0]), int(nose_3d_projection[0][0][1]))  # Direction point
+            
+            # Draw the nose direction line
             cv.line(frame, p1, p2, (255, 0, 255), 3)
+            
+            # Add a small circle at the end of the line for better visibility
+            cv.circle(frame, p2, 5, (255, 0, 255), -1)
+            
+            # Add calibration hint
+            if not calibrated:
+                cv.putText(frame, "Press 'c' to calibrate nose direction", 
+                         (50, img_h - 100), cv.FONT_HERSHEY_DUPLEX, 0.6, (0, 255, 255), 2)
             
             # getting the blinking ratio
             eyes_aspect_ratio = blinking_ratio(mesh_points_3D)
@@ -1155,6 +1352,17 @@ try:
                     status_color = (0, 255, 0) if proctoring_enabled else (128, 128, 128)
                     cv.putText(frame, f"Proctoring: {'ON' if proctoring_enabled else 'OFF'}", (img_w - 200, 320), 
                              cv.FONT_HERSHEY_DUPLEX, 0.6, status_color, 2, cv.LINE_AA)
+                    
+                    # Face detection quality indicator
+                    if 'face_quality' in locals():
+                        quality_color = (0, 255, 0) if face_quality > 0.7 else (0, 165, 255) if face_quality > 0.4 else (0, 0, 255)
+                        cv.putText(frame, f"Face Quality: {face_quality:.2f}", (img_w - 200, 350), 
+                                 cv.FONT_HERSHEY_DUPLEX, 0.6, quality_color, 2, cv.LINE_AA)
+                    
+                    # Detection status
+                    if face_detection_failures > 0:
+                        cv.putText(frame, f"Detection Issues: {face_detection_failures}", (img_w - 200, 380), 
+                                 cv.FONT_HERSHEY_DUPLEX, 0.6, (0, 0, 255), 2, cv.LINE_AA)
 
             # Printing data if enabled
             if PRINT_DATA:
@@ -1252,6 +1460,8 @@ try:
 
         
         # Displaying the processed frame
+        cv.namedWindow("Eye Tracking", cv.WINDOW_NORMAL)
+        cv.setWindowProperty("Eye Tracking", cv.WND_PROP_FULLSCREEN, cv.WINDOW_FULLSCREEN)
         cv.imshow("Eye Tracking", frame)
         # Handle key presses
         key = cv.waitKey(1) & 0xFF
@@ -1261,6 +1471,7 @@ try:
             initial_pitch, initial_yaw, initial_roll = pitch, yaw, roll
             if PRINT_DATA:
                 print("Head pose recalibrated.")
+                print("🎯 Nose direction line should now be straight when looking forward!")
                 
         # Inside the main loop, handle the 'r' key press
         if key == ord('r'):
