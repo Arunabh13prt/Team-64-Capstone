@@ -1,69 +1,3 @@
-"""
-Eye Tracking and Head Pose Estimation
-
-This script is designed to perform real-time eye tracking and head pose estimation using a webcam feed. 
-It utilizes the MediaPipe library for facial landmark detection, which informs both eye tracking and 
-head pose calculations. The purpose is to track the user's eye movements and head orientation, 
-which can be applied in various domains such as HCI (Human-Computer Interaction), gaming, and accessibility tools.
-
-Features:
-- Real-time eye tracking to count blinks and calculate the eye aspect ratio for each frame.
-- Head pose estimation to determine the orientation of the user's head in terms of pitch, yaw, and roll angles.
-- Calibration feature to set the initial head pose as the reference zero position.
-- Data logging for further analysis and debugging.
-
-Requirements:
-- Python 3.x
-- OpenCV (opencv-python)
-- MediaPipe (mediapipe)
-- Other Dependencies: math, socket, argparse, time, csv, datetime, os
-
-Methodology:
-- The script uses the 468 facial landmarks provided by MediaPipe's FaceMesh model.
-- Eye tracking is achieved by calculating the Eye Aspect Ratio (EAR) for each eye and detecting blinks based on EAR thresholds.
-- Head pose is estimated using the solvePnP algorithm with a predefined 3D facial model and corresponding 2D landmarks detected from the camera feed.
-- Angles are normalized to intuitive ranges (pitch: [-90, 90], yaw and roll: [-180, 180]).
-
-Theory:
-- EAR is used as a simple yet effective metric for eye closure detection.
-- Head pose angles are derived using a perspective-n-point approach, which estimates an object's pose from its 2D image points and 3D model points.
-
-UDP Packet Structure:
-- The UDP packet consists of a timestamp and four other integer values.
-- Packet Type: Mixed (int64 for timestamp, int32 for other values)
-- Packet Structure: [timestamp (int64), l_cx (int32), l_cy (int32), l_dx (int32), l_dy (int32)]
-- Packet Size: 24 bytes (8 bytes for int64 timestamp, 4 bytes each for the four int32 values)
-
-Example Packets:
-- Example 1: [1623447890123, 315, 225, 66, -3]
-- Example 2: [1623447891123, 227, 68, -1, 316]
-
-Parameters:
-You can change parameters such as face width, moving average window, webcam ID, terminal outputs, on-screen data, logging detail, etc., from the code.
-
-Author: Alireza Bagheri
-GitHub: https://github.com/alireza787b/Python-Gaze-Face-Tracker
-Email: p30planets@gmail.com
-LinkedIn: https://www.linkedin.com/in/alireza787b
-Date: November 2023
-
-Inspiration:
-Initially inspired by Asadullah Dal's iris segmentation project (https://github.com/Asadullah-Dal17/iris-Segmentation-mediapipe-python). 
-The blink detection feature is also contributed by Asadullah Dal (GitHub: Asadullah-Dal17).
-
-Usage:
-- Run the script in a Python environment with the necessary dependencies installed. The script accepts command-line arguments for camera source configuration.
-- Press 'c' to recalibrate the head pose estimation to the current orientation.
-- Press 'r' to start/stop logging.
-- Press 'q' to exit the program.
-- Output is displayed in a window with live feed and annotations, and logged to a CSV file for further analysis.
-
-Ensure that all dependencies, especially MediaPipe, OpenCV, and NumPy, are installed before running the script.
-
-Note:
-This project is intended for educational and research purposes in fields like aviation, human-computer interaction, and more.
-"""
-
 
 import cv2 as cv
 import numpy as np
@@ -797,127 +731,298 @@ def analyze_eye_movement_pattern(l_cx, l_cy, r_cx, r_cy, img_w, img_h):
     return suspicious_movement, movement_type, confidence
 
 
-def detect_gaze_violation(pitch, yaw, roll, l_cx, l_cy, r_cx, r_cy, img_w, img_h):
+
+
+def calculate_screen_boundaries_from_calibration(calibration_data):
     """
-    Enhanced gaze violation detection with calibration-based accuracy.
+    Calculate screen boundaries based on calibration data.
+    This defines the acceptable viewing area within the monitor screen.
+    
+    Args:
+        calibration_data: Dictionary containing calibration information
+        
+    Returns:
+        dict: Screen boundary information with acceptable gaze zones
+    """
+    if not calibration_data or 'eye_centers' not in calibration_data:
+        return None
+    
+    eye_centers = calibration_data['eye_centers']
+    
+    # Get boundary points from calibration
+    screen_bounds = {
+        'center': eye_centers.get('center', (0, 0)),
+        'top_left': eye_centers.get('top_left', (0, 0)),
+        'top_right': eye_centers.get('top_right', (0, 0)),
+        'bottom_left': eye_centers.get('bottom_left', (0, 0)),
+        'bottom_right': eye_centers.get('bottom_right', (0, 0)),
+        'top_center': eye_centers.get('top_center', (0, 0)),
+        'bottom_center': eye_centers.get('bottom_center', (0, 0)),
+        'left_center': eye_centers.get('left_center', (0, 0)),
+        'right_center': eye_centers.get('right_center', (0, 0))
+    }
+    
+    # Calculate acceptable viewing zone (add 10% margin for natural eye movement)
+    margin_factor = 0.1
+    
+    # Get extreme points
+    x_coords = [pos[0] for pos in eye_centers.values()]
+    y_coords = [pos[1] for pos in eye_centers.values()]
+    
+    min_x, max_x = min(x_coords), max(x_coords)
+    min_y, max_y = min(y_coords), max(y_coords)
+    
+    # Add margins
+    x_margin = (max_x - min_x) * margin_factor
+    y_margin = (max_y - min_y) * margin_factor
+    
+    acceptable_zone = {
+        'left_boundary': min_x - x_margin,
+        'right_boundary': max_x + x_margin,
+        'top_boundary': min_y - y_margin,
+        'bottom_boundary': max_y + y_margin,
+        'center_x': screen_bounds['center'][0],
+        'center_y': screen_bounds['center'][1],
+        'width': max_x - min_x + (2 * x_margin),
+        'height': max_y - min_y + (2 * y_margin)
+    }
+    
+    return acceptable_zone
+
+
+
+def is_gaze_within_screen_bounds(pupil_x, pupil_y, screen_boundaries):
+    """
+    Check if the current gaze position is within acceptable screen boundaries.
+    
+    Args:
+        pupil_x, pupil_y: Current pupil position
+        screen_boundaries: Screen boundary information from calibration
+        
+    Returns:
+        tuple: (is_within_bounds, zone_description, deviation_severity)
+    """
+    if not screen_boundaries:
+        # Fallback to basic center-based detection with larger tolerance
+        return True, "screen_center", 0.0
+    
+    left_bound = screen_boundaries['left_boundary']
+    right_bound = screen_boundaries['right_boundary']
+    top_bound = screen_boundaries['top_boundary']
+    bottom_bound = screen_boundaries['bottom_boundary']
+    
+    # Check if within acceptable screen area
+    within_horizontal = left_bound <= pupil_x <= right_bound
+    within_vertical = top_bound <= pupil_y <= bottom_bound
+    within_bounds = within_horizontal and within_vertical
+    
+    # Determine zone and deviation severity
+    if within_bounds:
+        # Within acceptable screen area
+        zone = "within_screen"
+        deviation = 0.0
+    else:
+        # Outside acceptable area - determine direction and severity
+        horizontal_deviation = 0
+        vertical_deviation = 0
+        
+        if pupil_x < left_bound:
+            horizontal_deviation = left_bound - pupil_x
+            horizontal_direction = "left"
+        elif pupil_x > right_bound:
+            horizontal_deviation = pupil_x - right_bound
+            horizontal_direction = "right"
+        else:
+            horizontal_direction = "center"
+        
+        if pupil_y < top_bound:
+            vertical_deviation = top_bound - pupil_y
+            vertical_direction = "up"
+        elif pupil_y > bottom_bound:
+            vertical_deviation = pupil_y - bottom_bound
+            vertical_direction = "down"
+        else:
+            vertical_direction = "center"
+        
+        # Determine primary direction
+        if horizontal_deviation > vertical_deviation:
+            zone = f"off_screen_{horizontal_direction}"
+            deviation = horizontal_deviation / screen_boundaries['width']
+        else:
+            zone = f"off_screen_{vertical_direction}"
+            deviation = vertical_deviation / screen_boundaries['height']
+        
+        # Cap deviation at 1.0
+        deviation = min(1.0, deviation)
+    
+    return within_bounds, zone, deviation
+
+
+
+def detect_gaze_violation(pitch, yaw, roll, l_cx, l_cy, r_cx, r_cy, img_w, img_h, calibration_data):
+    """
+    Enhanced gaze violation detection that considers screen boundaries from calibration.
+    Only triggers violations when gaze goes outside the calibrated screen area.
     
     Args:
         pitch, yaw, roll: Head pose angles
-        l_cx, l_cy, r_cx, r_cy: Left and right eye center coordinates
-        img_w, img_h: Image width and height
+        l_cx, l_cy, r_cx, r_cy: Eye center coordinates
+        img_w, img_h: Image dimensions
+        calibration_data: Calibration data containing screen boundaries
         
     Returns:
-        tuple: (violation_detected, gaze_direction, confidence, cheat_detected)
+        tuple: (violation_detected, gaze_status, confidence, cheat_detected, zone_info)
     """
     global last_gaze_direction, gaze_start_time, alert_triggered, violation_count
-    global calibration_data, calibration_completed
+    global suspicious_eye_movements
     
     if not proctoring_enabled:
-        return False, "forward", 0.0, False
+        return False, "forward", 0.0, False, "proctoring_disabled"
     
     current_time = time.time()
     violation_detected = False
-    gaze_direction = "forward"
+    gaze_status = "within_screen"
     confidence = 0.0
     cheat_detected = False
+    zone_info = "normal"
     
-    # Method 1: Head pose analysis
-    head_looking_left = yaw < -GAZE_THRESHOLD_ANGLE
-    head_looking_right = yaw > GAZE_THRESHOLD_ANGLE
-    head_looking_up = pitch > GAZE_THRESHOLD_ANGLE
-    head_looking_down = pitch < -GAZE_THRESHOLD_ANGLE
+    # Calculate average pupil position
+    pupil_x = (l_cx + r_cx) / 2
+    pupil_y = (l_cy + r_cy) / 2
     
-    # Method 2: Advanced pupil tracking and eye movement analysis
+    # Get screen boundaries from calibration
+    screen_boundaries = None
+    if calibration_data and calibration_completed:
+        screen_boundaries = calculate_screen_boundaries_from_calibration(calibration_data)
+    
+    # Check if gaze is within screen bounds
+    within_bounds, zone_description, deviation_severity = is_gaze_within_screen_bounds(
+        pupil_x, pupil_y, screen_boundaries
+    )
+    
+    # Enhanced eye movement analysis
     suspicious_movement, movement_type, eye_confidence = analyze_eye_movement_pattern(
         l_cx, l_cy, r_cx, r_cy, img_w, img_h
     )
     
-    # Method 3: Calibration-based pupil position analysis
-    if calibration_completed and calibration_data:
-        # Use calibrated screen center and thresholds
-        screen_center_x = calibration_data['screen_bounds']['center_x']
-        screen_center_y = calibration_data['screen_bounds']['center_y']
-        threshold_x = calibration_data.get('adaptive_threshold_x', PUPIL_DEVIATION_THRESHOLD)
-        threshold_y = calibration_data.get('adaptive_threshold_y', PUPIL_DEVIATION_THRESHOLD)
-    else:
-        # Fallback to default values
-        screen_center_x = img_w / 2
-        screen_center_y = img_h / 2
-        threshold_x = PUPIL_DEVIATION_THRESHOLD
-        threshold_y = PUPIL_DEVIATION_THRESHOLD
+    # Head pose analysis (backup method)
+    RELAXED_HEAD_THRESHOLD = 25  # Increased threshold for head pose
+    head_looking_significantly_away = (
+        abs(yaw) > RELAXED_HEAD_THRESHOLD or 
+        abs(pitch) > RELAXED_HEAD_THRESHOLD
+    )
     
-    pupil_center_x = (l_cx + r_cx) / 2
-    pupil_center_y = (l_cy + r_cy) / 2
-    
-    # Calculate precise deviations using calibrated thresholds
-    horizontal_deviation = pupil_center_x - screen_center_x
-    vertical_deviation = pupil_center_y - screen_center_y
-    
-    # Enhanced eye-only detection with calibrated thresholds
-    eye_looking_left = horizontal_deviation < -threshold_x
-    eye_looking_right = horizontal_deviation > threshold_x
-    eye_looking_up = vertical_deviation < -threshold_y
-    eye_looking_down = vertical_deviation > threshold_y
-    
-    # Determine gaze direction with enhanced detection
-    if head_looking_left or eye_looking_left:
-        gaze_direction = "left"
-        confidence = 0.9 if head_looking_left else 0.7
-        if not head_looking_left and eye_looking_left:
-            cheat_detected = True  # Eye-only movement detected
-    elif head_looking_right or eye_looking_right:
-        gaze_direction = "right"
-        confidence = 0.9 if head_looking_right else 0.7
-        if not head_looking_right and eye_looking_right:
-            cheat_detected = True  # Eye-only movement detected
-    elif head_looking_up or eye_looking_up:
-        gaze_direction = "up"
-        confidence = 0.9 if head_looking_up else 0.7
-        if not head_looking_up and eye_looking_up:
-            cheat_detected = True  # Eye-only movement detected
-    elif head_looking_down or eye_looking_down:
-        gaze_direction = "down"
-        confidence = 0.7
-    else:
-        gaze_direction = "forward"
-        confidence = 0.8
-    
-    # Check for suspicious eye movements (potential cheating)
-    if suspicious_movement and gaze_direction == "forward":
-        cheat_detected = True
-        gaze_direction = f"suspicious_{movement_type}"
-        confidence = eye_confidence
-    
-    # Check for violations
-    if gaze_direction in ["left", "right", "up"] or cheat_detected:
-        violation_detected = True
+    # Determine violation status
+    if not within_bounds:
+        # Check if looking down (allow this without triggering suspicion)
+        is_looking_down = "down" in zone_description
         
-        # Check if this is a new violation or continuation
-        if last_gaze_direction != gaze_direction:
-            last_gaze_direction = gaze_direction
+        if is_looking_down:
+            violation_detected = False
+            gaze_status = "looking_down"
+            confidence = 0.0
+            cheat_detected = False
+            zone_info = "allowed_looking_down"
+        else:
+            # Gaze is outside calibrated screen area and not looking down
+            violation_detected = True
+            gaze_status = zone_description
+            confidence = min(0.9, 0.5 + deviation_severity)
+            zone_info = f"deviation_{deviation_severity:.2f}"
+            
+            # Check if it's also a head movement (less suspicious) or eye-only (more suspicious)
+            if not head_looking_significantly_away and deviation_severity > 0.3:
+                cheat_detected = True  # Eye-only movement outside screen
+                confidence = min(0.95, confidence + 0.2)
+            
+    elif suspicious_movement:
+        # Within screen bounds but suspicious eye patterns
+        violation_detected = True
+        gaze_status = f"suspicious_{movement_type}"
+        confidence = eye_confidence
+        cheat_detected = True
+        zone_info = "suspicious_pattern"
+        
+    elif head_looking_significantly_away:
+        # Head turned significantly but eyes might still be on screen
+        # Only flag as violation if both head and eyes indicate looking away
+        if deviation_severity > 0.2:  # Some eye deviation too
+            violation_detected = True
+            gaze_status = "head_and_eye_deviation"
+            confidence = 0.7
+            zone_info = "combined_deviation"
+    
+    # Handle violation timing
+    if violation_detected:
+        if last_gaze_direction != gaze_status:
+            # New type of violation
+            last_gaze_direction = gaze_status
             gaze_start_time = current_time
             alert_triggered = False
+            if PRINT_DATA:
+                print(f"🔍 Potential violation detected: {gaze_status} (confidence: {confidence:.2f})")
         else:
-            # Same direction - check duration
-            if gaze_start_time and (current_time - gaze_start_time) >= GAZE_ALERT_DURATION:
-                if not alert_triggered:
-                    alert_triggered = True
-                    violation_count += 1
-                    if cheat_detected:
-                        print(f"🚨 ANTI-CHEAT ALERT: Suspicious eye movement detected! (Violation #{violation_count})")
-                    else:
-                        print(f"🚨 PROCTORING ALERT: Looking {gaze_direction} for {GAZE_ALERT_DURATION}+ seconds! (Violation #{violation_count})")
-    else:
-        # Looking forward - reset violation tracking
-        if last_gaze_direction in ["left", "right", "up"] or last_gaze_direction and "suspicious" in last_gaze_direction:
+            # Continuing same violation
             duration = current_time - gaze_start_time if gaze_start_time else 0
-            print(f"✅ Returned to forward gaze after {last_gaze_direction} for {duration:.1f} seconds")
+            if duration >= GAZE_ALERT_DURATION and not alert_triggered:
+                alert_triggered = True
+                violation_count += 1
+                
+                if cheat_detected:
+                    print(f"🚨 CHEATING DETECTED: {gaze_status} for {duration:.1f}s! (Violation #{violation_count})")
+                else:
+                    print(f"🚨 SCREEN VIOLATION: Looking outside screen area for {duration:.1f}s! (Violation #{violation_count})")
+    else:
+        # No violation - reset tracking
+        if last_gaze_direction:
+            duration = current_time - gaze_start_time if gaze_start_time else 0
+            if PRINT_DATA and duration > 2:  # Only log if it was a significant duration
+                print(f"✅ Returned to acceptable viewing area after {last_gaze_direction} for {duration:.1f}s")
         last_gaze_direction = None
         gaze_start_time = None
         alert_triggered = False
+        gaze_status = "within_screen"
+        zone_info = "normal"
     
-    return violation_detected, gaze_direction, confidence, cheat_detected
+    return violation_detected, gaze_status, confidence, cheat_detected, zone_info
 
+def draw_screen_boundaries_overlay(frame, calibration_data):
+    """
+    Draw the acceptable viewing area overlay on the frame for debugging.
+    
+    Args:
+        frame: OpenCV frame
+        calibration_data: Calibration data
+        
+    Returns:
+        Modified frame with overlay
+    """
+    if not calibration_data or not calibration_completed:
+        return frame
+    
+    screen_boundaries = calculate_screen_boundaries_from_calibration(calibration_data)
+    if not screen_boundaries:
+        return frame
+    
+    # Draw acceptable viewing zone as a rectangle
+    left = int(screen_boundaries['left_boundary'])
+    right = int(screen_boundaries['right_boundary'])
+    top = int(screen_boundaries['top_boundary'])
+    bottom = int(screen_boundaries['bottom_boundary'])
+    
+    # Draw boundary rectangle (green = acceptable area)
+    cv.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+    
+    # Add label
+    cv.putText(frame, "Acceptable Viewing Area", 
+               (left, top - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    
+    # Draw center point
+    center_x = int(screen_boundaries['center_x'])
+    center_y = int(screen_boundaries['center_y'])
+    cv.circle(frame, (center_x, center_y), 5, (0, 255, 0), -1)
+    
+    return frame
 
 # This function calculates the blinking ratio of a person.
 def blinking_ratio(landmarks):
@@ -1308,9 +1413,9 @@ try:
                     proctoring_roll -= initial_roll
                 
                 # Detect gaze violations with anti-cheat measures
-                violation_detected, gaze_direction, confidence, cheat_detected = detect_gaze_violation(
+                violation_detected, gaze_direction, confidence, cheat_detected, zone_info = detect_gaze_violation(
                     proctoring_pitch, proctoring_yaw, proctoring_roll,
-                    l_cx, l_cy, r_cx, r_cy, img_w, img_h
+                    l_cx, l_cy, r_cx, r_cy, img_w, img_h, calibration_data
                 )
                 
                 # Display proctoring status on screen
